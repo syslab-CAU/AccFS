@@ -1,0 +1,433 @@
+diff --git a/module_nova-fortis/commit.c b/module_nova-fortis/commit.c
+index 557691813..1514052e9 100644
+--- a/module_nova-fortis/commit.c
++++ b/module_nova-fortis/commit.c
+@@ -101,14 +101,33 @@ atomic_t inflight_arr[128];
+ //        atomic_dec(&cpu_inflight);
+ //}
+ 
++static inline size_t nova_cpu_inflight_charge(size_t bytes)
++{
++        if (bytes <= 4UL * 1024UL)
++                return CPU_INFLIGHT_CHARGE_4K;
++
++        if (bytes <= 32UL * 1024UL)
++                return CPU_INFLIGHT_CHARGE_32K;
++
++        if (bytes <= 64UL * 1024UL)
++                return CPU_INFLIGHT_CHARGE_64K;
++
++        if (bytes <= 128UL * 1024UL)
++                return CPU_INFLIGHT_CHARGE_128K;
++
++        return CPU_INFLIGHT_CHARGE_256K;
++}
++
+ inline void inc_cpu_inflight(size_t bytes)
+ {
+-        atomic64_add((s64)bytes, &cpu_inflight_byte);
++        atomic64_add((s64)nova_cpu_inflight_charge(bytes),
++                     &cpu_inflight_byte);
+ }
+ 
+ inline void dec_cpu_inflight(size_t bytes)
+ {
+-        atomic64_sub((s64)bytes, &cpu_inflight_byte);
++        atomic64_sub((s64)nova_cpu_inflight_charge(bytes),
++                     &cpu_inflight_byte);
+ }
+ 
+ //static inline bool pick_cpu_or_dsa_for_data(void)
+@@ -147,40 +166,42 @@ inline void dec_cpu_inflight(size_t bytes)
+ //        return USE_CPU;
+ //}
+ 
+-static inline bool pick_cpu_or_dsa_for_data(void)
++static inline bool pick_cpu_or_dsa_by_charge(size_t bytes, size_t limit)
+ {
+         s64 inflight;
++        size_t charge;
+ 
+         inflight = atomic64_read(&cpu_inflight_byte);
++        charge = nova_cpu_inflight_charge(bytes);
+ 
+-        if (inflight >= DATA_INFLIGHT_BYTE_LIMIT)
++        if ((u64)inflight + charge > limit)
+                 return USE_DSA;
+ 
+         return USE_CPU;
+ }
+ 
+-static inline bool pick_cpu_or_dsa_for_meta(void)
++static inline bool pick_cpu_or_dsa_for_data(size_t bytes)
+ {
+-        s64 inflight;
+-
+-        inflight = atomic64_read(&cpu_inflight_byte);
++        return pick_cpu_or_dsa_by_charge(bytes, DATA_INFLIGHT_BYTE_LIMIT);
++}
+ 
+-        if (inflight >= META_INFLIGHT_BYTE_LIMIT)
+-                return USE_DSA;
++static inline bool pick_cpu_or_dsa_for_meta(size_t bytes)
++{
++        return pick_cpu_or_dsa_by_charge(bytes, META_INFLIGHT_BYTE_LIMIT);
++}
+ 
+-        return USE_CPU;
++inline bool pick_cpu_or_dsa_for_csum_bytes(size_t bytes)
++{
++        return pick_cpu_or_dsa_by_charge(bytes, CSUM_INFLIGHT_BYTE_LIMIT);
+ }
+ 
++/*
++ * Keep the old checksum API for checksum.c.  External metadata entry checksum
++ * calls do not pass a basis size, so treat them as one small CPU operation.
++ */
+ inline bool pick_cpu_or_dsa_for_csum(void)
+ {
+-        s64 inflight;
+-
+-        inflight = atomic64_read(&cpu_inflight_byte);
+-
+-        if (inflight >= CSUM_INFLIGHT_BYTE_LIMIT)
+-                return USE_DSA;
+-
+-        return USE_CPU;
++        return pick_cpu_or_dsa_for_csum_bytes(4UL * 1024UL);
+ }
+ 
+ static inline void dbuf_staged_inc(struct super_block *sb, struct nova_inode_info_header *sih, unsigned long pages)
+@@ -387,20 +408,10 @@ inline void *nova_get_data_block_csum_addr(struct super_block *sb,
+ 
+ 
+ 
+-#define NOVA_LOG_WENTRY_PER_PAGE \
+-        (LOG_BLOCK_TAIL / sizeof(struct nova_file_write_entry))
+-#define NOVA_LOG_TAIL_CL_OFF   (PAGE_SIZE - CACHELINE_SIZE)
+-
+ struct log_page_batch {
+         struct list_head list;
+         u64 block_off;    /* BLOCK_OFF(curr_p) */
+-        u8 *page_buf;     /* PAGE_SIZE shadow copy */
+-
+-        /* Number of write entries added to this log page in this commit. */
+-        unsigned int entry_count;
+-
+-        /* Offset of the first write entry added to this log page. */
+-        size_t first_entry_off;
++        u8 *page_buf;    /* PAGE_SIZE shadow copy */
+ };
+ 
+ static void nova_free_log_page_batch_list(struct list_head *head)
+@@ -439,16 +450,13 @@ get_or_create_log_batch(struct super_block *sb,
+         }
+ 
+         /*
+-         * PMEM log page의 현재 상태를 DRAM shadow page로 복사한다.
+-         * 이 commit에서 추가하는 write entry와 page tail만 shadow에 반영한 뒤,
+-         * flush 단계에서 entry_count 기준으로 4KB flush/부분 flush를 고른다.
++         * PMEM log page의 현재 상태를 DRAM shadow page로 복사.
++         * 새로 할당된 log page라면 nova_get_append_head() 이후의 초기 상태가 들어있음.
+          */
+         src = nova_get_block(sb, block_off);
+         memcpy(b->page_buf, src, PAGE_SIZE);
+ 
+         b->block_off = block_off;
+-        b->entry_count = 0;
+-        b->first_entry_off = 0;
+         INIT_LIST_HEAD(&b->list);
+         list_add_tail(&b->list, batch_list);
+ 
+@@ -463,23 +471,18 @@ static int from_stage_we_to_shadow(struct super_block *sb,
+         struct log_page_batch *batch;
+         struct nova_inode_log_page *log_page;
+         size_t off_in_page;
+-        u32 num_entries;
+ 
+         batch = get_or_create_log_batch(sb, batch_list, BLOCK_OFF(entry_p));
+         if (!batch)
+                 return -ENOMEM;
+ 
+-        off_in_page = ENTRY_LOC(entry_p);
+-        if (batch->entry_count == 0)
+-                batch->first_entry_off = off_in_page;
++        off_in_page = entry_p & (PAGE_SIZE - 1);
+ 
+         memcpy(batch->page_buf + off_in_page, entry,
+                sizeof(struct nova_file_write_entry));
+-        batch->entry_count++;
+ 
+         log_page = (struct nova_inode_log_page *)batch->page_buf;
+-        num_entries = le32_to_cpu(log_page->page_tail.num_entries);
+-        log_page->page_tail.num_entries = cpu_to_le32(num_entries + 1);
++        log_page->page_tail.num_entries++;
+ 
+         return 0;
+ }
+@@ -505,7 +508,7 @@ static int flush_log_pages(struct super_block *sb,
+ #elif defined(ONLY_USE_DSA_FOR_META)
+ 		use_dsa_for_meta = 1;
+ #elif defined(ADAPTIVE_FOR_META)
+-		use_dsa_for_meta = pick_cpu_or_dsa_for_meta();
++		use_dsa_for_meta = pick_cpu_or_dsa_for_meta(total);
+ #else
+ 		printk(KERN_ERR "[%s] add commit.h\n", __func__);
+ #endif
+@@ -545,24 +548,6 @@ static int flush_log_pages(struct super_block *sb,
+         return 0;
+ }
+ 
+-static void flush_log_range(struct super_block *sb,
+-        struct log_page_batch *b, size_t off, size_t len)
+-{
+-        void *dst = (u8 *)nova_get_block(sb, b->block_off) + off;
+-        void *src = b->page_buf + off;
+-        unsigned long irq_flags = 0;
+-
+-        nova_memunlock_range(sb, dst, len, &irq_flags);
+-        inc_cpu_inflight(len);
+-        inc_cpu_inflight_bytes(len);
+-        atomic_inc(&cpu_inflight_meta);
+-        memcpy_to_pmem_nocache(dst, src, len);
+-        dec_cpu_inflight_bytes(len);
+-        dec_cpu_inflight(len);
+-        nova_flush_buffer(dst, len, 0);
+-        nova_memlock_range(sb, dst, len, &irq_flags);
+-}
+-
+ static int flush_shadow_pages(struct super_block *sb,
+                 struct list_head *batch_list)
+ {
+@@ -570,55 +555,36 @@ static int flush_shadow_pages(struct super_block *sb,
+         struct log_page_batch *run_first = NULL;
+         u64 prev_page = 0;
+         unsigned int run_pages = 0;
+-        size_t len;
+         int ret;
+ 
+-        BUILD_BUG_ON(NOVA_LOG_PAGE_FLUSH_ENTRY_THRESHOLD == 0);
+-        BUILD_BUG_ON(NOVA_LOG_PAGE_FLUSH_ENTRY_THRESHOLD >
+-                NOVA_LOG_WENTRY_PER_PAGE);
+-
+         list_for_each_entry(b, batch_list, list) {
+-                if (b->entry_count >= NOVA_LOG_PAGE_FLUSH_ENTRY_THRESHOLD) {
+-                        if (run_first && b->block_off == prev_page + PAGE_SIZE) {
+-                                prev_page = b->block_off;
+-                                run_pages++;
+-                                continue;
+-                        }
+-
+-                        if (run_first) {
+-                                ret = flush_log_pages(sb, run_first, run_pages);
+-                                if (ret)
+-                                        return ret;
+-                        }
+-
++                if (!run_first) {
+                         run_first = b;
+                         prev_page = b->block_off;
+                         run_pages = 1;
+                         continue;
+                 }
+ 
+-                if (run_first) {
+-                        ret = flush_log_pages(sb, run_first, run_pages);
+-                        if (ret)
+-                                return ret;
+-                        run_first = NULL;
+-                        run_pages = 0;
++                if (b->block_off == prev_page + PAGE_SIZE) {
++                        prev_page = b->block_off;
++                        run_pages++;
++                        continue;
+                 }
+ 
+-                /*
+-                 * batch는 from_stage_we_to_shadow()에서만 만들어지므로
+-                 * entry_count는 항상 1 이상이다. append는 log tail 순서라서
+-                 * 이번 commit에서 이 page에 추가한 write entry들도 연속이다.
+-                 */
+-                len = b->entry_count * sizeof(struct nova_file_write_entry);
+-                flush_log_range(sb, b, b->first_entry_off, len);
++                ret = flush_log_pages(sb, run_first, run_pages);
++                if (ret)
++                        return ret;
+ 
+-                /* page_tail과 NEXT_PAGE marker가 있는 마지막 cacheline. */
+-                flush_log_range(sb, b, NOVA_LOG_TAIL_CL_OFF, CACHELINE_SIZE);
++                run_first = b;
++                prev_page = b->block_off;
++                run_pages = 1;
+         }
+ 
+-        if (run_first)
+-                return flush_log_pages(sb, run_first, run_pages);
++        if (run_first) {
++                ret = flush_log_pages(sb, run_first, run_pages);
++                if (ret)
++                        return ret;
++        }
+ 
+         return 0;
+ }
+@@ -1195,6 +1161,7 @@ err:
+ #define CSUM0 NOVA_INIT_CSUM
+ static inline void nova_calc_block_csum_parity_full(struct super_block *sb,
+         const u8 *block,
++        size_t basis_bytes,
+         __le32 *crc_out,      /* 4KB block당 1개 crc (4 bytes) */
+         u8 *parity_out)       /* parity는 기존처럼 512 bytes */
+ {
+@@ -1208,24 +1175,24 @@ static inline void nova_calc_block_csum_parity_full(struct super_block *sb,
+ //                u32 crc = nova_calc_crc_by_commit_ratio(sb, CSUM0, block,
+ //                                                         blocksize, ctrl);
+ #ifdef ONLY_USE_CPU_FOR_CHECKSUM
+-		inc_cpu_inflight(blocksize);
++		inc_cpu_inflight(basis_bytes);
+ 		inc_cpu_inflight_bytes(blocksize);
+ 		atomic_inc(&cpu_inflight_csum);
+                 u32 crc = nova_crc32c(CSUM0, block, blocksize);
+ 		dec_cpu_inflight_bytes(blocksize);
+-		dec_cpu_inflight(blocksize);
++		dec_cpu_inflight(basis_bytes);
+ #elif defined(ONLY_USE_DSA_FOR_CHECKSUM)
+         	u32 crc = nova_dma_crc32c_auto(sb, CSUM0, block, blocksize);
+ #elif defined(ADAPTIVE_FOR_CHECKSUM)
+-		bool use_dsa = pick_cpu_or_dsa_for_csum();
++		bool use_dsa = pick_cpu_or_dsa_for_csum_bytes(basis_bytes);
+ 		u32 crc;
+ 		if (!use_dsa) {
+-			inc_cpu_inflight(blocksize);
++			inc_cpu_inflight(basis_bytes);
+ 			inc_cpu_inflight_bytes(blocksize);
+ 			atomic_inc(&cpu_inflight_csum);
+ 			crc = nova_crc32c(CSUM0, block, blocksize);
+ 			dec_cpu_inflight_bytes(blocksize);
+-			dec_cpu_inflight(blocksize);
++			dec_cpu_inflight(basis_bytes);
+ 		} else {
+ 			crc = nova_dma_crc32c_auto(sb, CSUM0, block, blocksize);
+ 		}
+@@ -1282,6 +1249,7 @@ atomic_t low_2, mid_2, high_2, super_high_2;
+ atomic_t max_2;
+ static inline void nova_flush_segs(struct super_block *sb,
+         struct nova_pmem_seg *segs, int nr,
++        size_t basis_bytes,
+         unsigned long *irq_flags)
+ {
+         int i;
+@@ -1294,7 +1262,7 @@ static inline void nova_flush_segs(struct super_block *sb,
+ #elif defined(ONLY_USE_DSA_FOR_META)
+ 		use_dsa_for_meta = 1;
+ #elif defined(ADAPTIVE_FOR_META)
+-		use_dsa_for_meta = pick_cpu_or_dsa_for_meta();
++		use_dsa_for_meta = pick_cpu_or_dsa_for_meta(basis_bytes);
+ #else
+ 		printk(KERN_ERR "[%s] add commit.h\n", __func__);
+ #endif
+@@ -1302,13 +1270,13 @@ static inline void nova_flush_segs(struct super_block *sb,
+                 nova_memunlock_range(sb, segs[i].dst, segs[i].len, irq_flags);
+ 
+                 if (!use_dsa_for_meta) {
+-			inc_cpu_inflight(segs[i].len);
++			inc_cpu_inflight(basis_bytes);
+ 			inc_cpu_inflight_bytes(segs[i].len);
+ 			atomic_inc(&cpu_inflight_meta);
+                         memcpy_to_pmem_nocache(segs[i].dst, segs[i].src,
+                                                segs[i].len);
+ 			dec_cpu_inflight_bytes(segs[i].len);
+-			dec_cpu_inflight(segs[i].len);
++			dec_cpu_inflight(basis_bytes);
+ 		} else {
+                         nova_dma_memcpy(segs[i].dst, segs[i].src,
+                                         segs[i].len);
+@@ -1374,7 +1342,7 @@ static int nova_flush_node_csum_parity_batch(struct super_block *sb,
+                 if (data_parity > 0)
+                         parity = parity_buf + i * strp_size;
+ 
+-                nova_calc_block_csum_parity_full(sb, blk_src, crc, parity);
++                nova_calc_block_csum_parity_full(sb, blk_src, n->blk_cnt * sb->s_blocksize, crc, parity);
+ 
+                 if (data_csum > 0) {
+                         void *dst0 = nova_get_data_block_csum_addr(sb, sih, blk, 0);
+@@ -1395,12 +1363,12 @@ static int nova_flush_node_csum_parity_batch(struct super_block *sb,
+         }
+ 
+         if (data_csum > 0) {
+-                nova_flush_segs(sb, csum0, nr0, &irq_flags);
+-                nova_flush_segs(sb, csum1, nr1, &irq_flags);
++                nova_flush_segs(sb, csum0, nr0, n->blk_cnt * sb->s_blocksize, &irq_flags);
++                nova_flush_segs(sb, csum1, nr1, n->blk_cnt * sb->s_blocksize, &irq_flags);
+         }
+ 
+         if (data_parity > 0)
+-                nova_flush_segs(sb, par, nrp, &irq_flags);
++                nova_flush_segs(sb, par, nrp, n->blk_cnt * sb->s_blocksize, &irq_flags);
+ 
+ out:
+         kfree(csum0);
+@@ -1444,7 +1412,7 @@ int flush_data_buffers(struct super_block *sb, struct inode *inode)
+ #elif defined(ONLY_USE_DSA_FOR_DATA)
+ 		use_dsa_for_data = 1;
+ #elif defined(ADAPTIVE_FOR_DATA)
+-		use_dsa_for_data = pick_cpu_or_dsa_for_data();
++		use_dsa_for_data = pick_cpu_or_dsa_for_data(total);
+ #else
+ 		printk(KERN_ERR "[%s] add commit.h!!!!\n", __func__);
+ #endif
+diff --git a/module_nova-fortis/commit.h b/module_nova-fortis/commit.h
+index 8d4db93aa..bd014030b 100644
+--- a/module_nova-fortis/commit.h
++++ b/module_nova-fortis/commit.h
+@@ -5,7 +5,22 @@
+ //#define META_INFLIGHT_LIMIT	6
+ //#define CSUM_INFLIGHT_LIMIT	6
+ 
+-#define CPU_INFLIGHT_BYTE_LIMIT	(100UL * 1024UL)
++#define CPU_INFLIGHT_BYTE_LIMIT	(60UL * 1024UL)
++
++/*
++ * cpu_inflight_byte is a virtual CPU budget, not raw bytes.
++ * These charges reproduce the measured optimal count-based limits:
++ *   4K   -> about 11 CPU operations
++ *   32K  -> about 6 CPU operations
++ *   64K  -> about 4 CPU operations
++ *   128K -> about 3 CPU operations
++ *   256K -> about 2 CPU operations
++ */
++#define CPU_INFLIGHT_CHARGE_4K		(4608UL)
++#define CPU_INFLIGHT_CHARGE_32K		(9UL * 1024UL)
++#define CPU_INFLIGHT_CHARGE_64K		(12UL * 1024UL)
++#define CPU_INFLIGHT_CHARGE_128K		(16UL * 1024UL)
++#define CPU_INFLIGHT_CHARGE_256K		(24UL * 1024UL)
+ 
+ #define DATA_INFLIGHT_BYTE_LIMIT	CPU_INFLIGHT_BYTE_LIMIT
+ #define META_INFLIGHT_BYTE_LIMIT	CPU_INFLIGHT_BYTE_LIMIT
+@@ -48,18 +63,6 @@
+ 
+ #define NOVA_BLOCK_CSUM_SIZE   sizeof(__le32)
+ 
+-#ifndef NOVA_LOG_PAGE_FLUSH_ENTRY_THRESHOLD
+-/*
+- * commit_process()에서 한 log page batch에 이번 commit으로 추가된
+- * write entry 수가 이 값 이상이면 4KB log page 전체를 flush한다.
+- *
+- * 1  : 기존 구현처럼 batch가 생기면 항상 page 단위 flush
+- * 10 : write entry 10개 이상부터 page 단위 flush
+- * 63 : write entry가 한 page를 모두 채울 때만 page 단위 flush
+- */
+-#define NOVA_LOG_PAGE_FLUSH_ENTRY_THRESHOLD 63U
+-#endif
+-
+ #define CPU_DSA_SPLIT        10
+ 
+ #define USE_CPU 0
+@@ -85,6 +88,7 @@ extern atomic64_t cpu_inflight_byte;
+ inline void inc_cpu_inflight(size_t bytes);
+ inline void dec_cpu_inflight(size_t bytes);
+ inline bool pick_cpu_or_dsa_for_csum(void);
++inline bool pick_cpu_or_dsa_for_csum_bytes(size_t bytes);
+ 
+ //inline void inc_cpu_inflight(void);
+ //inline void dec_cpu_inflight(void);
